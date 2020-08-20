@@ -1,0 +1,423 @@
+#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#  SPDX-License-Identifier: MIT-0
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#  software and associated documentation files (the "Software"), to deal in the Software
+#  without restriction, including without limitation the rights to use, copy, modify,
+#  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#  permit persons to whom the Software is furnished to do so.
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#  PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#  SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS SAM templete for running Asycnhronous ML workloads (Inference or ETL) using SageMaker Batch Transform.
+
+Parameters: 
+
+  ModelName: 
+    Type: String
+    Description: Name of the model to be used for the SageMaker Batch Transform job.
+
+  JobStreamShardCount: 
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of shards for the Kinesis stream
+  
+  TriggerType: 
+    Type: String
+    Default: 's3'
+    AllowedValues: 
+      - 's3'
+      - 'schedule'
+    Description: > 
+      Parameter that indicates the event type that triggers the SageMaker Batch Transform job.
+      Supports "s3" and "schedule" modes.
+
+  ScheduleRate: 
+    Type: String
+    Default: hour
+    AllowedValues: 
+      - minute
+      - hour
+      - day
+      - month
+      - year
+    Description: >
+      The rate in which the SageMaker Batch Transform job is trigerred. 
+      Applicable only if TriggerType is set to "schedule".
+
+  KinesisBatchSize: 
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: Maximum number of records that Kinesis retrieves in a single batch before invoking the stream processor lambda.
+
+  KinesisMaximumBatchingWindowInSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+    Description: Maximum amount of time in seconds to gather Kinesis records before invoking the stream processor lambda.
+
+Conditions:
+
+  EnableS3Trigger: !Equals [!Ref TriggerType, "s3"]
+
+  EnableScheduleTrigger: !Equals [!Ref TriggerType, "schedule"]
+
+Resources:
+  
+  JobStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: !Ref JobStreamShardCount
+
+  JobTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "jobId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "jobId"
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: True
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+
+  AsyncMLAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: SHARED
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt ApiFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Sub ${AWS::Region}
+          JOB_TABLE_NAME: !Ref JobTable
+          JOB_STREAM_NAME: !Ref JobStream
+      Events:
+        SubmitJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AsyncMLAPI
+            Path: /job
+            Method: post
+            Auth:
+              ApiKeyRequired: true
+        DescribeJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AsyncMLAPI
+            Path: /job/{id}
+            Method: get
+            Auth:
+              ApiKeyRequired: true
+  
+  InferenceStreamProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/stream_processor/
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt InferenceStreamProcessorFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Sub ${AWS::Region}
+          JOB_TABLE_NAME: !Ref JobTable
+          JOB_STREAM_NAME: !Ref JobStream
+          S3_BUCKET: !Ref S3Bucket
+      Events:
+        JobStream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt JobStream.Arn
+            BatchSize: !Ref KinesisBatchSize
+            MaximumBatchingWindowInSeconds: !Ref KinesisMaximumBatchingWindowInSeconds
+            StartingPosition: LATEST
+            Enabled: true   
+
+  S3TriggerFunction:
+    Type: AWS::Serverless::Function
+    Condition: EnableS3Trigger
+    Properties:
+      CodeUri: src/s3_trigger/
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt S3TriggerFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Sub ${AWS::Region}
+          MODEL_NAME: !Ref ModelName
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket:
+              Ref: S3Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value: data
+
+  ScheduleTriggerFunction:
+    Type: AWS::Serverless::Function
+    Condition: EnableScheduleTrigger
+    Properties:
+      CodeUri: src/schedule_trigger/
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt ScheduleTriggerFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Sub ${AWS::Region}
+          SCHEDULE_RATE: !Ref ScheduleRate
+          S3_BUCKET: !Ref S3Bucket
+          MODEL_NAME: !Ref ModelName
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub 'rate(1 ${ScheduleRate})'
+            Name: JobSchedule
+            Description: job schedule event
+            Enabled: true
+
+  ResultUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/result_update/
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt ResultUpdateFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Sub ${AWS::Region}
+          JOB_TABLE_NAME: !Ref JobTable
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref S3Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value: result
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  
+  InferenceStreamProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  S3TriggerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  ScheduleTriggerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  ResultUpdateFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  LogPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LogPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - arn:aws:logs:*:*:*
+      Roles:
+        - !Ref ApiFunctionRole
+        - !Ref InferenceStreamProcessorFunctionRole
+        - !Ref S3TriggerFunctionRole
+        - !Ref ScheduleTriggerFunctionRole
+        - !Ref ResultUpdateFunctionRole
+
+  KinesisPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: KinesisPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:DescribeStream
+              - kinesis:GetShardIterator
+              - kinesis:GetRecords
+            Resource:
+              - !GetAtt JobStream.Arn
+      Roles:
+        - !Ref ApiFunctionRole
+        - !Ref InferenceStreamProcessorFunctionRole
+
+  SageMakerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: SageMakerPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sagemaker:CreateTransformJob'
+            Resource:
+              - '*'
+      Roles:
+        - !Ref S3TriggerFunctionRole
+        - !Ref ScheduleTriggerFunctionRole
+
+  DynamoPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DynamoPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:BatchWriteItem
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt JobTable.Arn
+      Roles:
+        - !Ref ApiFunctionRole
+        - !Ref InferenceStreamProcessorFunctionRole
+        - !Ref ResultUpdateFunctionRole
+
+  S3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !GetAtt S3Bucket.Arn
+          - Effect: Allow
+            Action:
+              - 's3:*Object'
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', !Ref S3Bucket, '/*']]
+      Roles:
+        - !Ref InferenceStreamProcessorFunctionRole
+        - !Ref S3TriggerFunctionRole
+        - !Ref ScheduleTriggerFunctionRole
+        - !Ref ResultUpdateFunctionRole
+
+Outputs:
+
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL for Prod stage for API function"
+    Value: !Sub "https://${AsyncMLAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  ApiKeyId:
+    Description: "ID of the API Key"
+    Value: !Ref ServerlessApiKey
+  JobTableName:
+    Description: "Job Table Name"
+    Value: !Ref JobTable
+  JobStreamName:
+    Description: "Kinesis Job Stream Name"
+    Value: !Ref JobStream
+  S3BucketName:
+    Description: "S3 Bucket Name"
+    Value: !Ref S3Bucket
